@@ -1,0 +1,6 @@
+{
+  "dependencies": [
+    "liburing",
+    "fmt"
+  ]
+}
