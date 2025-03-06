@@ -32,5 +32,5 @@ clean:
 	rm -rf build
 
 format:
-	find src/ -iname *.h -o -iname *.cpp | xargs clang-format --sort-includes=0 -style=file -i
+	find src/ -iname *.hpp -o -iname *.cpp | xargs clang-format --sort-includes=0 -style=file -i
 	cmake-format -i CMakeLists.txt
