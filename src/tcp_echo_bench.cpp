@@ -22,10 +22,10 @@ struct Stats {
 
 void SendAndReceive(tcp::ClientSocket& client, Stats& stats, std::atomic<bool>& started, std::atomic<bool>& stopped) try {
   std::vector<char> buffer(FLAGS_message_size, 'X');
-  while (!started.load(std::memory_order_relaxed)) {
+  while (!started.load(std::memory_order_acquire)) {
   }
 
-  while (!stopped.load(std::memory_order_relaxed)) {
+  while (!stopped.load(std::memory_order_acquire)) {
     client.WriteAll(buffer.data(), buffer.size());
     client.ReadAll(buffer.data(), buffer.size());
     stats.received.fetch_add(1, std::memory_order_release);
@@ -40,10 +40,10 @@ void SendAndReceive(tcp::ClientSocket& client, Stats& stats, std::atomic<bool>& 
 
 void Send(tcp::ClientSocket& client, Stats& stats, std::atomic<bool>& started, std::atomic<bool>& stopped) try {
   std::vector<char> buffer(FLAGS_message_size, 'X');
-  while (!started.load(std::memory_order_relaxed)) {
+  while (!started.load(std::memory_order_acquire)) {
   }
 
-  while (!stopped.load(std::memory_order_relaxed)) {
+  while (!stopped.load(std::memory_order_acquire)) {
     client.WriteAll(buffer.data(), buffer.size());
     stats.sent.fetch_add(1, std::memory_order_release);
   }
@@ -56,7 +56,7 @@ void Send(tcp::ClientSocket& client, Stats& stats, std::atomic<bool>& started, s
 void Receive(tcp::ClientSocket& client, Stats& stats) try {
   std::vector<char> buffer(FLAGS_message_size, 'X');
 
-  while (!stats.stopped.load(std::memory_order_relaxed) ||
+  while (!stats.stopped.load(std::memory_order_acquire) ||
          stats.received.load(std::memory_order_acquire) < stats.sent.load(std::memory_order_acquire)) {
     client.ReadAll(buffer.data(), buffer.size());
     stats.received.fetch_add(1, std::memory_order_release);
@@ -115,7 +115,7 @@ int main(int argc, char** argv) {
     }
   }
 
-  started.store(true, std::memory_order_relaxed);
+  started.store(true, std::memory_order_release);
 
   auto last_received = (uint64_t)0;
   for (int i = 0; i < FLAGS_duration; i++) {
@@ -132,7 +132,7 @@ int main(int argc, char** argv) {
     last_received = received;
   }
 
-  stopped.store(true, std::memory_order_relaxed);
+  stopped.store(true, std::memory_order_release);
 
   for (auto& t : threads) {
     t.join();
