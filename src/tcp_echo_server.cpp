@@ -10,11 +10,14 @@
 
 #include "tcp_sockets.hpp"
 
+DEFINE_bool(polling, false, "use io_uring polling mode");
+DEFINE_bool(batch_submit, true, "submit io_uring requests in batch");
 DEFINE_int32(backlog, 100, "backlog");
 DEFINE_uint32(port, 54322, "listening port");
+DEFINE_uint32(sq_size, 1024, "io_uring submission queue size");
+DEFINE_uint32(cq_size, 0, "io_uring completion queue size");
+DEFINE_uint32(thread_idle, 5, "max idle time of submission queue polling thread, in seconds");
 DEFINE_uint64(max_message_size, 1024, "maximum message size in bytes");
-DEFINE_uint32(max_connections, 1024, "maximum connections");
-DEFINE_bool(batch_submit, true, "submit io_uring requests in batch");
 
 void Submit(io_uring *ring) {
   if (auto r = io_uring_submit(ring); r < 0) {
@@ -223,8 +226,20 @@ int main(int argc, char **argv) {
 
   std::cout << "Listening on " << bind_addr << '\n';
 
+  auto params = io_uring_params{};
+  memset(&params, 0, sizeof(params));
+
+  if (FLAGS_cq_size > 0) {
+    params.cq_entries = FLAGS_cq_size;
+    params.flags |= IORING_SETUP_CQSIZE;
+  }
+  if (FLAGS_polling) {
+    params.sq_thread_idle = FLAGS_thread_idle * 1000;
+    params.flags |= IORING_SETUP_SQPOLL;
+  }
+
   auto ring = io_uring{};
-  if (auto r = ::io_uring_queue_init(FLAGS_max_connections, &ring, 0); r < 0) {
+  if (auto r = io_uring_queue_init_params(FLAGS_sq_size, &ring, &params); r < 0) {
     std::cerr << "init queue failed: %s" << strerror(-r) << '\n';
     return -1;
   }
