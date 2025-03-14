@@ -186,16 +186,20 @@ void AcceptContext::OnComplete(io_uring *ring, io_uring_cqe *cqe) {
 }
 
 void HandleCompleteEvents(io_uring *ring) {
+  const int kSize = 128;
+  io_uring_cqe *cqes[kSize];
   while (true) {
-    io_uring_cqe *cqe;
-    if (auto r = io_uring_wait_cqe(ring, &cqe); r != 0) {
+    if (auto r = io_uring_wait_cqe(ring, &cqes[0]); r != 0) {
       throw std::runtime_error(fmt::format("wait cqe failed: {}", strerror(-r)));
     }
 
-    auto cb = reinterpret_cast<Context *>(cqe->user_data);
-    cb->OnComplete(ring, cqe);
+    auto nready = io_uring_peek_batch_cqe(ring, cqes, kSize);
+    for (auto i = 0u; i < nready; i++) {
+      auto cb = reinterpret_cast<Context *>(cqes[i]->user_data);
+      cb->OnComplete(ring, cqes[i]);
+    }
 
-    io_uring_cqe_seen(ring, cqe);
+    io_uring_cq_advance(ring, nready);
   }
 }
 
