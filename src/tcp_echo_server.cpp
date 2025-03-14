@@ -14,12 +14,21 @@ DEFINE_int32(backlog, 100, "backlog");
 DEFINE_uint32(port, 54322, "listening port");
 DEFINE_uint64(max_message_size, 1024, "maximum message size in bytes");
 DEFINE_uint32(max_connections, 1024, "maximum connections");
+DEFINE_bool(batch_submit, true, "submit io_uring requests in batch");
+
+void Submit(io_uring *ring) {
+  if (auto r = io_uring_submit(ring); r < 0) {
+    throw std::runtime_error(fmt::format("submit failed: {}", strerror(-r)));
+  } else if (r == 0) {
+    throw std::runtime_error("no request submitted");
+  }
+}
 
 class Context {
  public:
   virtual ~Context() = default;
 
-  virtual void OnComplete(io_uring *ring, io_uring_cqe *cqe) = 0;
+  virtual bool OnComplete(io_uring *ring, io_uring_cqe *cqe) = 0;
 };
 
 class ConnectionContext final : public Context {
@@ -30,13 +39,13 @@ class ConnectionContext final : public Context {
 
   void AddSend(io_uring *ring, bool submit);
 
-  void OnComplete(io_uring *ring, io_uring_cqe *cqe) override;
+  bool OnComplete(io_uring *ring, io_uring_cqe *cqe) override;
 
  private:
   enum RequestType { kRecv, kSend };
 
-  void OnRecvComplete(io_uring *ring, io_uring_cqe *cqe);
-  void OnSendComplete(io_uring *ring, io_uring_cqe *cqe);
+  bool OnRecvComplete(io_uring *ring, io_uring_cqe *cqe);
+  bool OnSendComplete(io_uring *ring, io_uring_cqe *cqe);
   void Write(std::string *message);
 
   std::unique_ptr<tcp::Connection> conn_;
@@ -54,11 +63,7 @@ void ConnectionContext::AddRecv(io_uring *ring, bool submit) {
   sqe->user_data = reinterpret_cast<uintptr_t>(this);
 
   if (submit) {
-    if (auto r = io_uring_submit(ring); r < 0) {
-      throw std::runtime_error(fmt::format("submit failed: {}", strerror(-r)));
-    } else if (r == 0) {
-      throw std::runtime_error("submit sqe returned 0");
-    }
+    Submit(ring);
   }
 
   type_ = kRecv;
@@ -73,28 +78,25 @@ void ConnectionContext::AddSend(io_uring *ring, bool submit) {
   sqe->user_data = reinterpret_cast<uintptr_t>(this);
 
   if (submit) {
-    if (auto r = io_uring_submit(ring); r < 0) {
-      throw std::runtime_error(fmt::format("submit failed: {}", strerror(-r)));
-    } else if (r == 0) {
-      throw std::runtime_error("submitted 0 request");
-    }
+    Submit(ring);
   }
 
   type_ = kSend;
 }
 
-void ConnectionContext::OnComplete(io_uring *ring, io_uring_cqe *cqe) try {
+bool ConnectionContext::OnComplete(io_uring *ring, io_uring_cqe *cqe) try {
   if (type_ == kRecv) {
-    OnRecvComplete(ring, cqe);
+    return OnRecvComplete(ring, cqe);
   } else {
-    OnSendComplete(ring, cqe);
+    return OnSendComplete(ring, cqe);
   }
 } catch (const std::exception &e) {
   std::cerr << conn_->peer() << ": " << e.what() << '\n';
   delete this;
+  return false;
 }
 
-void ConnectionContext::OnRecvComplete(io_uring *ring, io_uring_cqe *cqe) {
+bool ConnectionContext::OnRecvComplete(io_uring *ring, io_uring_cqe *cqe) {
   assert(type_ == kRecv);
   if (cqe->res < 0) {
     throw SocketException(-cqe->res);
@@ -104,24 +106,26 @@ void ConnectionContext::OnRecvComplete(io_uring *ring, io_uring_cqe *cqe) {
     buffer_.resize(cqe->res);
     Write(&buffer_);
     if (buffer_.empty()) {
-      AddRecv(ring, true);
+      AddRecv(ring, !FLAGS_batch_submit);
     } else {
-      AddSend(ring, true);
+      AddSend(ring, !FLAGS_batch_submit);
     }
+    return FLAGS_batch_submit;
   }
 }
 
-void ConnectionContext::OnSendComplete(io_uring *ring, io_uring_cqe *cqe) {
+bool ConnectionContext::OnSendComplete(io_uring *ring, io_uring_cqe *cqe) {
   assert(type_ == kSend);
   if (cqe->res < 0) {
     throw SocketException(-cqe->res);
   } else if (cqe->res < (int32_t)buffer_.size()) {
     buffer_.erase(buffer_.begin(), buffer_.begin() + cqe->res);
-    AddSend(ring, true);
+    AddSend(ring, !FLAGS_batch_submit);
   } else {
     assert(cqe->res == (int32_t)buffer_.size());
-    AddRecv(ring, true);
+    AddRecv(ring, !FLAGS_batch_submit);
   }
+  return FLAGS_batch_submit;
 }
 
 void ConnectionContext::Write(std::string *message) {
@@ -140,9 +144,9 @@ class AcceptContext final : public Context {
 
   ~AcceptContext() override = default;
 
-  void AddAccept(io_uring *ring);
+  void AddAccept(io_uring *ring, bool submit);
 
-  void OnComplete(io_uring *ring, io_uring_cqe *cqe) override;
+  bool OnComplete(io_uring *ring, io_uring_cqe *cqe) override;
 
   AcceptContext(const AcceptContext &) = delete;   // Delete copy ctor
   AcceptContext(AcceptContext &&) = delete;        // Delete move ctor: now usage now
@@ -153,21 +157,19 @@ class AcceptContext final : public Context {
   tcp::ServerSocket *server_;
 };
 
-void AcceptContext::AddAccept(io_uring *ring) {
+void AcceptContext::AddAccept(io_uring *ring, bool submit) {
   auto sqe = io_uring_get_sqe(ring);
   if (sqe == nullptr) {
     throw std::runtime_error("get sqe failed");
   }
   io_uring_prep_multishot_accept(sqe, server_->fd(), nullptr, nullptr, 0);
   sqe->user_data = reinterpret_cast<uintptr_t>(this);
-  if (auto r = io_uring_submit(ring); r < 0) {
-    throw std::runtime_error(fmt::format("submit failed: {}", strerror(-r)));
-  } else if (r == 0) {
-    throw std::runtime_error("submit returned 0");
+  if (submit) {
+    Submit(ring);
   }
 }
 
-void AcceptContext::OnComplete(io_uring *ring, io_uring_cqe *cqe) {
+bool AcceptContext::OnComplete(io_uring *ring, io_uring_cqe *cqe) {
   if (cqe->res < 0) {
     throw AcceptException(-cqe->res);
   }
@@ -178,11 +180,12 @@ void AcceptContext::OnComplete(io_uring *ring, io_uring_cqe *cqe) {
   std::cout << conn->peer() << " connected\n";
 
   auto conn_ctx = new ConnectionContext(std::move(conn));
-  conn_ctx->AddRecv(ring, true);
+  conn_ctx->AddRecv(ring, !FLAGS_batch_submit);
 
   if (!(cqe->flags & IORING_CQE_F_MORE)) {
-    AddAccept(ring);
+    AddAccept(ring, !FLAGS_batch_submit);
   }
+  return FLAGS_batch_submit;
 }
 
 void HandleCompleteEvents(io_uring *ring) {
@@ -193,10 +196,15 @@ void HandleCompleteEvents(io_uring *ring) {
       throw std::runtime_error(fmt::format("wait cqe failed: {}", strerror(-r)));
     }
 
+    auto submit = false;
     auto nready = io_uring_peek_batch_cqe(ring, cqes, kSize);
     for (auto i = 0u; i < nready; i++) {
-      auto cb = reinterpret_cast<Context *>(cqes[i]->user_data);
-      cb->OnComplete(ring, cqes[i]);
+      auto cb = static_cast<Context *>(io_uring_cqe_get_data(cqes[i]));
+      submit |= cb->OnComplete(ring, cqes[i]);
+    }
+
+    if (submit) {
+      Submit(ring);
     }
 
     io_uring_cq_advance(ring, nready);
@@ -222,7 +230,7 @@ int main(int argc, char **argv) {
   }
 
   auto ctx = AcceptContext(&server);
-  ctx.AddAccept(&ring);
+  ctx.AddAccept(&ring, true);
 
   try {
     HandleCompleteEvents(&ring);
