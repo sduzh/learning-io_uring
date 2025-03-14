@@ -10,9 +10,18 @@
 
 #include "tcp_sockets.hpp"
 
+DEFINE_bool(direct_write, true,
+            "Upon receiving a message, first attempt to directly call the non-blocking write/send interfaces to send the message back to "
+            "the client");
 DEFINE_int32(backlog, 100, "backlog");
 DEFINE_uint32(port, 54322, "listening port");
 DEFINE_uint64(max_message_size, 1024, "maximum message size in bytes");
+
+void epoll_ctl_ex(int epfd, int op, int fd, struct epoll_event* event) {
+  if (epoll_ctl(epfd, op, fd, event)) {
+    throw std::runtime_error(fmt::format("epoll_ctl failed: E{}: {}", errno, strerror(errno)));
+  }
+}
 
 class Context {
  public:
@@ -57,10 +66,7 @@ void ServerContext::HandleEpollEvent(int epoll_fd, epoll_event* event) {
   auto new_ev = epoll_event{};
   new_ev.events = EPOLLIN /* | EPOLLET*/;
   new_ev.data.ptr = conn_ctx.release();
-  if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, conn_fd, &new_ev)) {
-    perror("epoll_ctl");
-    exit(EXIT_FAILURE);
-  }
+  epoll_ctl_ex(epoll_fd, EPOLL_CTL_ADD, conn_fd, &new_ev);
 }
 
 void ConnectionContext::HandleEpollEvent(int epoll_fd, epoll_event* event) {
@@ -68,10 +74,7 @@ void ConnectionContext::HandleEpollEvent(int epoll_fd, epoll_event* event) {
     DoHandleEpollEvent(epoll_fd, event);
   } catch (const std::exception& ex) {
     std::cerr << conn_->peer() << ": " << ex.what() << '\n';
-    if (epoll_ctl(epoll_fd, EPOLL_CTL_DEL, conn_->fd(), nullptr)) {
-      perror("epoll_ctl");
-      exit(EXIT_FAILURE);
-    }
+    epoll_ctl_ex(epoll_fd, EPOLL_CTL_DEL, conn_->fd(), nullptr);
     delete this;
   }
 }
@@ -86,16 +89,19 @@ void ConnectionContext::DoHandleEpollEvent(int epoll_fd, epoll_event* event) {
     }
     buffer_.resize(old_size + nr);
 
-    Write(&buffer_);
+    auto add_epollout = false;
+    if (FLAGS_direct_write) {
+      Write(&buffer_);
+      add_epollout = !buffer_.empty();
+    } else {
+      add_epollout = old_size == 0;
+    }
 
-    if (!buffer_.empty()) {
-      // Remove EPOLLOUT event
+    if (add_epollout) {
       auto new_ev = epoll_event{};
       new_ev.data.ptr = this;
-      new_ev.events = EPOLLIN;
-      if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, conn_->fd(), &new_ev)) {
-        throw std::runtime_error(fmt::format("epoll_ctl failed: {}", strerror(errno)));
-      }
+      new_ev.events = EPOLLIN | EPOLLOUT;
+      epoll_ctl_ex(epoll_fd, EPOLL_CTL_MOD, conn_->fd(), &new_ev);
     }
   }
 
@@ -109,9 +115,7 @@ void ConnectionContext::DoHandleEpollEvent(int epoll_fd, epoll_event* event) {
       auto new_ev = epoll_event{};
       new_ev.data.ptr = this;
       new_ev.events = EPOLLIN;
-      if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, conn_->fd(), &new_ev)) {
-        throw std::runtime_error(fmt::format("epoll_ctl failed: {}", strerror(errno)));
-      }
+      epoll_ctl_ex(epoll_fd, EPOLL_CTL_MOD, conn_->fd(), &new_ev);
     }
   }
 }
@@ -144,10 +148,7 @@ int main(int argc, char** argv) {
   auto ev = epoll_event{};
   ev.events = EPOLLIN;
   ev.data.ptr = &server_ctx;
-  if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server.fd(), &ev)) {
-    perror("epoll_ctl");
-    return -1;
-  }
+  epoll_ctl_ex(epoll_fd, EPOLL_CTL_ADD, server.fd(), &ev);
 
   const int kMaxEvents = 100;
   epoll_event events[kMaxEvents];

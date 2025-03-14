@@ -12,6 +12,9 @@
 
 DEFINE_bool(polling, false, "use io_uring polling mode");
 DEFINE_bool(batch_submit, true, "submit io_uring requests in batch");
+DEFINE_bool(direct_write, true,
+            "Upon receiving a message, first attempt to directly call the non-blocking write/send interfaces to send the message back to "
+            "the client. Only if the message is not fully sent, then use io_uring to write.");
 DEFINE_int32(backlog, 100, "backlog");
 DEFINE_uint32(port, 54322, "listening port");
 DEFINE_uint32(sq_size, 1024, "io_uring submission queue size");
@@ -107,7 +110,9 @@ bool ConnectionContext::OnRecvComplete(io_uring *ring, io_uring_cqe *cqe) {
     throw std::runtime_error("peer closed");
   } else {
     buffer_.resize(cqe->res);
-    Write(&buffer_);
+    if (FLAGS_direct_write) {
+      Write(&buffer_);
+    }
     if (buffer_.empty()) {
       AddRecv(ring, !FLAGS_batch_submit);
     } else {
